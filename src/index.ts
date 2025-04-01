@@ -46,6 +46,7 @@ interface GeminiKeyInfo {
 	modelUsage?: Record<string, number>;
 	categoryUsage?: { pro: number; flash: number };
 	name?: string;
+	errorStatus?: 401 | 403 | null; // Added to track 401/403 errors
 }
 
 /**
@@ -233,8 +234,8 @@ function parseDataUri(dataUri: string): { mimeType: string; data: string } | nul
 }
 
 // Helper to transform OpenAI request body parts (messages, tools) to Gemini format
-// Added requestedModelId parameter
-function transformOpenAiToGemini(requestBody: any, requestedModelId?: string): { contents: any[]; systemInstruction?: any; tools?: any[] } {
+// Added requestedModelId and safetyEnabled parameters
+function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, safetyEnabled: boolean = true): { contents: any[]; systemInstruction?: any; tools?: any[] } {
 	const messages = requestBody.messages || [];
 	const openAiTools = requestBody.tools;
 
@@ -254,25 +255,34 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string): {
 				role = 'model';
 				break;
 			case 'system':
-				// Check if the model is gemma-based
-				if (requestedModelId && requestedModelId.startsWith('gemma')) {
-					// If gemma, treat system prompt as a user message
-					console.log(`Gemma model detected (${requestedModelId}). Treating system message as user message.`);
+				// New logic: Check safetyEnabled first
+				if (!safetyEnabled) {
+					// If safety is OFF, always treat system prompt as a user message
+					console.log(`Safety disabled. Treating system message as user message.`);
 					role = 'user';
 					// Content processing for 'user' role will happen below
 				} else {
-					// Original logic for non-gemma models: create systemInstruction
-					if (typeof msg.content === 'string') {
-						systemInstruction = { role: "system", parts: [{ text: msg.content }] };
-					} else if (Array.isArray(msg.content)) { // Handle complex system prompts if needed
-						const textContent = msg.content.find((p: any) => p.type === 'text')?.text;
-						if (textContent) {
-							systemInstruction = { role: "system", parts: [{ text: textContent }] };
+					// Safety is ON, apply original logic (Gemma check)
+					if (requestedModelId && requestedModelId.startsWith('gemma')) {
+						// If gemma, treat system prompt as a user message
+						console.log(`Gemma model detected (${requestedModelId}). Treating system message as user message.`);
+						role = 'user';
+						// Content processing for 'user' role will happen below
+					} else {
+						// Original logic for non-gemma models with safety ON: create systemInstruction
+						if (typeof msg.content === 'string') {
+							systemInstruction = { role: "system", parts: [{ text: msg.content }] };
+						} else if (Array.isArray(msg.content)) { // Handle complex system prompts if needed
+							const textContent = msg.content.find((p: any) => p.type === 'text')?.text;
+							if (textContent) {
+								systemInstruction = { role: "system", parts: [{ text: textContent }] };
+							}
 						}
+						// Skip adding this message to 'contents' when creating systemInstruction
+						return; 
 					}
-					return; // Skip adding this message to 'contents' for non-gemma
 				}
-				break; // Break for 'system' role (gemma case falls through to content processing)
+				break; // Break for 'system' role (both safety off and gemma cases fall through to content processing)
 			default:
 				console.warn(`Unknown role encountered: ${msg.role}. Skipping message.`);
 				return; // Skip unknown roles
@@ -553,7 +563,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	// Get and store Worker API Key for later use
 	workerApiKey = request.headers.get('Authorization')?.replace('Bearer ', '') || null;
 
-	// --- Key Selection (使用基于权重的选择) ---
+	// --- Key Selection (Using weighted selection) ---
 	const selectedKey = await getNextAvailableGeminiKey(env, ctx, requestedModelId);
 	if (!selectedKey) {
 		return new Response(JSON.stringify({ error: "No available Gemini API Key configured." }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
@@ -648,14 +658,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	// --- End New Quota Check ---
 
 
-	// --- Transform Request Body ---
-	// Pass requestedModelId to the transformation function
-	const { contents, systemInstruction, tools: geminiTools } = transformOpenAiToGemini(requestBody, requestedModelId);
-	if (contents.length === 0 && !systemInstruction) {
-		// Require at least one message even if tools are present
-		return new Response(JSON.stringify({ error: "No valid user, assistant messages found (system messages converted for gemma)." }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
-	}
-
+	// --- Determine Safety Setting ---
 	let safetyEnabled = true; 
 	
 	if (workerApiKey) {
@@ -668,8 +671,16 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				}
 			} catch (e) {
 				console.error("Error parsing safety settings:", e);
+				// Keep safetyEnabled = true on error
 			}
 		}
+	}
+
+	// --- Transform Request Body ---
+	// Pass requestedModelId and safetyEnabled to the transformation function
+	const { contents, systemInstruction, tools: geminiTools } = transformOpenAiToGemini(requestBody, requestedModelId, safetyEnabled);
+	if (contents.length === 0 && !systemInstruction) {
+		return new Response(JSON.stringify({ error: "No valid user, assistant messages found (system messages converted based on safety/gemma)." }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 	
 	const geminiRequestBody: any = {
@@ -685,11 +696,11 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	
 	if (!safetyEnabled) {
 		geminiRequestBody.safetySettings = [
-			{ category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+			{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' }
 		];
 	}
 
@@ -757,7 +768,19 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				// Force set the quota to its limit for this category/model on this key for today
 				ctx.waitUntil(forceSetQuotaToLimit(selectedKey.id, env, modelCategory, requestedModelId));
 			}
-			// --- End New 429 Handling ---
+			// --- New: Handle 401/403 for error tracking ---
+			if (geminiResponse.status === 401 || geminiResponse.status === 403) {
+				console.warn(`Received ${geminiResponse.status} from Gemini for key ${selectedKey.id}. Recording error status.`);
+				ctx.waitUntil(recordKeyError(selectedKey.id, env, geminiResponse.status as 401 | 403));
+			}
+			// --- End New 401/403 Handling ---
+
+			// --- Existing 429 Handling ---
+			if (geminiResponse.status === 429) {
+				console.warn(`Received 429 from Gemini for key ${selectedKey.id}, category ${modelCategory}${modelCategory === 'Custom' ? ` (model ${requestedModelId})` : ''}. Forcing quota to limit for today.`);
+				ctx.waitUntil(forceSetQuotaToLimit(selectedKey.id, env, modelCategory, requestedModelId));
+			}
+			// --- End Existing 429 Handling ---
 
 			return new Response(JSON.stringify({
 				error: {
@@ -966,6 +989,10 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
 				return await handleTestGeminiKey(request, env, ctx);
 			case 'gemini-models':
 				return await handleAdminGeminiModels(request, env, ctx);
+			case 'error-keys': // New route to get keys with errors
+				return await handleAdminGetErrorKeys(request, env, ctx);
+			case 'clear-key-error': // New route to clear a key's error
+				return await handleAdminClearKeyError(request, env, ctx);
 			default:
 				return new Response(JSON.stringify({ error: "Unknown admin resource" }), { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 		}
@@ -1038,7 +1065,15 @@ async function handleTestGeminiKey(request: Request, env: Env, ctx: ExecutionCon
 
 		if (response.ok) {
 			ctx.waitUntil(incrementKeyUsage(body.keyId, env, body.modelId, modelCategory));
+		} else {
+			// --- New: Record 401/403 errors during test ---
+			if (response.status === 401 || response.status === 403) {
+				console.warn(`Received ${response.status} during test for key ${body.keyId}. Recording error status.`);
+				ctx.waitUntil(recordKeyError(body.keyId, env, response.status as 401 | 403));
+			}
+			// --- End New Error Recording ---
 		}
+
 
 		return new Response(JSON.stringify({
 			success: response.ok,
@@ -1054,6 +1089,92 @@ async function handleTestGeminiKey(request: Request, env: Env, ctx: ExecutionCon
 }
 
 // --- Admin API Resource Handlers ---
+
+// New handler to get keys with errors
+async function handleAdminGetErrorKeys(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
+	if (request.method !== 'GET') {
+		return new Response(JSON.stringify({ error: `Method ${request.method} not allowed for error-keys` }),
+			{ status: 405, headers: { ...headers, 'Allow': 'GET' } });
+	}
+
+	try {
+		const listResult = await env.GEMINI_KEYS_KV.list({ prefix: 'key:' });
+		const errorKeyPromises = listResult.keys.map(async (keyMeta) => {
+			const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyMeta.name);
+			if (!keyInfoJson) return null;
+			try {
+				const keyInfoData = JSON.parse(keyInfoJson) as Partial<GeminiKeyInfo>;
+				if (keyInfoData.errorStatus === 401 || keyInfoData.errorStatus === 403) {
+					const keyId = keyMeta.name.replace('key:', '');
+					return {
+						id: keyId,
+						name: keyInfoData.name || keyId,
+						error: keyInfoData.errorStatus,
+					};
+				}
+				return null;
+			} catch (e) {
+				console.error(`Error processing error status for key ${keyMeta.name}:`, e);
+				return null;
+			}
+		});
+
+		const errorKeys = (await Promise.all(errorKeyPromises)).filter(k => k !== null);
+		return new Response(JSON.stringify(errorKeys), { headers });
+
+	} catch (error) {
+		console.error(`Error handling admin API for Error Keys:`, error);
+		const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
+		return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers });
+	}
+}
+
+// New handler to clear a key's error status
+async function handleAdminClearKeyError(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
+	if (request.method !== 'POST') {
+		return new Response(JSON.stringify({ error: `Method ${request.method} not allowed for clear-key-error` }),
+			{ status: 405, headers: { ...headers, 'Allow': 'POST' } });
+	}
+
+	const body = await readRequestBody<{ keyId: string }>(request);
+	if (!body || typeof body.keyId !== 'string' || body.keyId.trim() === '') {
+		return new Response(JSON.stringify({ error: 'Request body must include a valid non-empty string: keyId' }), { status: 400, headers });
+	}
+
+	const keyIdToClear = body.keyId.trim();
+	const keyKvName = `key:${keyIdToClear}`;
+
+	try {
+		const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyKvName);
+		if (!keyInfoJson) {
+			return new Response(JSON.stringify({ error: `Key with ID '${keyIdToClear}' not found.` }), { status: 404, headers });
+		}
+
+		let keyInfoData = JSON.parse(keyInfoJson) as Partial<GeminiKeyInfo>;
+
+		if (keyInfoData.errorStatus === null || keyInfoData.errorStatus === undefined) {
+			// No error to clear, but still return success
+			return new Response(JSON.stringify({ success: true, id: keyIdToClear, message: "No error status to clear." }), { headers });
+		}
+
+		// Clear the error status
+		keyInfoData.errorStatus = null;
+
+		// Save back to KV
+		await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(keyInfoData));
+		console.log(`Cleared error status for key ${keyIdToClear}.`);
+
+		return new Response(JSON.stringify({ success: true, id: keyIdToClear }), { headers });
+
+	} catch (error) {
+		console.error(`Error clearing error status for key ${keyIdToClear}:`, error);
+		const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
+		return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers });
+	}
+}
+
 
 async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionContext, resourceId?: string): Promise<Response> {
 	const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
@@ -1122,7 +1243,8 @@ async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionC
 							usageDate: keyInfoData.usageDate || 'N/A',
 							modelUsage: modelUsageData, 
 							categoryUsage: categoryUsageData,
-							categoryQuotas: categoryQuotas
+							categoryQuotas: categoryQuotas,
+							errorStatus: keyInfoData.errorStatus // Include error status
 						};
 					} catch (e) {
 						console.error(`Error processing key ${keyMeta.name}:`, e);
@@ -1169,7 +1291,8 @@ async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionC
 					usageDate: '', 
 					name: keyName,
 					modelUsage: {},
-					categoryUsage: { pro: 0, flash: 0 }
+					categoryUsage: { pro: 0, flash: 0 },
+					errorStatus: null // Initialize error status
 				};
 
 				await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(newKeyInfo));
@@ -1761,9 +1884,9 @@ function handleLogoutRequest(): Response {
 // --- Gemini Key Management ---
 
 /**
- * 根据权重选择API密钥。权重基于密钥的使用次数，使用次数越少权重越高。
- * 权重计算考虑请求的模型ID，不同模型有独立的使用计数。
- * 不在此处检查配额，配额检查在handleV1ChatCompletions中进行。
+ * Selects an API key based on weight. Weight is based on the number of times the key has been used; the fewer times used, the higher the weight.
+ * Weight calculation considers the requested model ID; different models have independent usage counts.
+ * Quota checking is not performed here; it is done in handleV1ChatCompletions.
  */
 async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, requestedModelId?: string): Promise<{ id: string; key: string } | null> {
 	try {
@@ -1775,10 +1898,10 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, reques
 			return null;
 		}
 
-		// 获取今天的日期（洛杉矶时区）
+		// Get today's date (Los Angeles timezone)
 		const todayInLA = getTodayInLA();
 		
-		// 获取每个密钥的信息并计算权重
+		// Get information for each key and calculate weight
 		const keysWithWeights: Array<{
 			id: string;
 			key: string;
@@ -1797,21 +1920,28 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, reques
 			}
 
 			try {
-				// 解析KV中的JSON字符串
+				// Parse the JSON string from KV
 				const keyInfoData = JSON.parse(keyInfoJson) as Partial<Omit<GeminiKeyInfo, 'id'>>;
+
+				// --- New: Skip keys with 401/403 errors ---
+				if (keyInfoData.errorStatus === 401 || keyInfoData.errorStatus === 403) {
+					console.log(`Skipping key ${keyId} due to error status: ${keyInfoData.errorStatus}`);
+					continue; // Skip this key
+				}
+				// --- End New ---
 				
-				// 如果密钥的使用日期不是今天，则其使用量应被视为0
+				// If the key's usage date is not today, its usage should be considered 0
 				const isCurrentDay = keyInfoData.usageDate === todayInLA;
 				const totalUsage = isCurrentDay ? (keyInfoData.usage || 0) : 0;
 				
-				// 获取特定模型的使用量
+				// Get the usage count for the specific model
 				let modelSpecificUsage = 0;
 				if (requestedModelId && isCurrentDay && keyInfoData.modelUsage) {
 					modelSpecificUsage = keyInfoData.modelUsage[requestedModelId] || 0;
 				}
 				
-				// 计算权重 - 权重与使用量成反比
-				// 使用小值1防止除以零，并使用指数函数使差异更加明显
+				// Calculate weight - weight is inversely proportional to usage
+				// Use a small value 1 to prevent division by zero and use an exponential function to make the difference more pronounced
 				const baseWeight = Math.exp(-modelSpecificUsage / 10) * 100;
 				
 				keysWithWeights.push({
@@ -1827,29 +1957,29 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, reques
 			}
 		}
 
-		// 检查是否有可用的密钥
+		// Check if there are any available keys
 		if (keysWithWeights.length === 0) {
 			console.error("No usable Gemini keys found.");
 			return null;
 		}
 
-		// 按权重排序（从高到低）并记录日志
+		// Sort by weight (high to low) and log
 		keysWithWeights.sort((a, b) => b.weight - a.weight);
 		
-		// 记录排序结果（用于调试）
+		// Log the sorting results (for debugging)
 		console.log("Keys sorted by weight (higher weight = higher priority):");
 		keysWithWeights.forEach(k => {
 			console.log(`Key: ${k.id}, Model usage: ${k.modelUsage}, Total usage: ${k.usage}, Weight: ${k.weight.toFixed(2)}`);
 		});
 
-		// 使用加权随机选择
-		// 1. 计算权重总和
+		// Use weighted random selection
+		// 1. Calculate the sum of weights
 		const totalWeight = keysWithWeights.reduce((sum, key) => sum + key.weight, 0);
 		
-		// 2. 生成0到totalWeight之间的随机数
+		// 2. Generate a random number between 0 and totalWeight
 		const randomValue = Math.random() * totalWeight;
 		
-		// 3. 通过权重选择密钥
+		// 3. Select the key based on weight
 		let cumulativeWeight = 0;
 		for (const keyInfo of keysWithWeights) {
 			cumulativeWeight += keyInfo.weight;
@@ -1862,7 +1992,7 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, reques
 			}
 		}
 		
-		// 如果由于浮点误差而未选择任何密钥，则返回权重最高的密钥
+		// If no key is selected due to floating-point errors, return the key with the highest weight
 		console.log(`Fallback: Selected highest weighted key: ${keysWithWeights[0].id}`);
 		return {
 			id: keysWithWeights[0].id,
@@ -2057,6 +2187,35 @@ async function forceSetQuotaToLimit(keyId: string, env: Env, category: 'Pro' | '
 
 	} catch (e) {
 		console.error(`Failed to force quota limit for key ${keyId}:`, e);
+	}
+	// Removed extra closing brace here
+}
+
+
+/**
+ * Records a 401 or 403 error status for a given Gemini Key ID in KV.
+ */
+async function recordKeyError(keyId: string, env: Env, status: 401 | 403): Promise<void> {
+	const keyKvName = `key:${keyId}`;
+	try {
+		const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyKvName);
+		if (!keyInfoJson) {
+			console.warn(`Cannot record error: Key info not found for ID: ${keyId}`);
+			return;
+		}
+
+		let keyInfoData = JSON.parse(keyInfoJson) as Partial<GeminiKeyInfo>;
+
+		// Update the error status
+		keyInfoData.errorStatus = status;
+
+		// Put the updated info back into KV
+		await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(keyInfoData));
+		console.log(`Recorded error status ${status} for key ${keyId}.`);
+
+	} catch (e) {
+		console.error(`Failed to record error status for key ${keyId}:`, e);
+		// Don't rethrow here, as recording the error is secondary
 	}
 }
 
